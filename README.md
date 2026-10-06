@@ -5,7 +5,7 @@ and convert its memory channels into a **CHIRP** generic CSV file. No CS-R8600,
 no Windows, and no typing the same channels in twice.
 
 CHIRP has no IC-R8600 driver, and Icom's CS-R8600 programming software is
-Windows-only and cannot export to CHIRP. This project contains three small
+Windows-only and cannot export to CHIRP. This project contains four small
 Python scripts:
 
 | Script | What it does |

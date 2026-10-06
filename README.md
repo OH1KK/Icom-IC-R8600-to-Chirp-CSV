@@ -12,11 +12,11 @@ Python scripts:
 |---|---|
 | `r8600_probe.py` | Checks that the radio answers on its USB serial port |
 | `r8600_dump.py` | Reads the whole radio memory and saves it as an `.icf` file |
+| `r8600_restore.py` | Writes an `.icf` file back to the radio |
 | `r8600_icf2chirp.py` | Converts an `.icf` file into a CHIRP CSV |
 
-The `.icf` files written by `r8600_dump.py` open in CS-R8600 too, so the dump
-script also works as a Linux backup tool. Reading is always read-only: nothing
-is ever written to the radio.
+The `.icf` files written by `r8600_dump.py` open in CS-R8600 too, so together
+with `r8600_restore.py` this is a complete Linux backup and restore tool.
 
 ## Features
 
@@ -87,6 +87,36 @@ Reads the full memory (channels, groups, scan edges and settings) and writes an
 | `-t SECONDS` | Give up after this long without data (default `10`) |
 | `--log FILE` | Save every raw byte from the radio, for troubleshooting |
 
+### r8600_restore.py
+
+Writes an `.icf` file (from `r8600_dump.py` or CS-R8600) back to the radio. This
+**overwrites the whole radio memory**: channels, groups, scan edges and
+settings. For safety the script:
+
+1. checks that the file is a complete IC-R8600 image and that its memory map
+   revision (`MapRev`) matches the radio,
+2. reads the current radio memory and saves it as
+   `ic-r8600-before-restore-YYYYMMDD-HHMMSS.icf`,
+3. asks you to type `yes`,
+4. writes the image and checks the radio's clone result,
+5. reads the radio back and compares it byte by byte with the file.
+
+```
+python3 r8600_restore.py backup.icf
+```
+
+| Option | Description |
+|---|---|
+| `-p PORT` | Serial port (default `/dev/ttyUSB0`) |
+| `-b BAUD` | Speed (default `9600`, the cautious choice; `115200` is faster) |
+| `--delay SECONDS` | Extra pause after each 64-byte block |
+| `--no-backup` | Skip the backup read |
+| `--no-verify` | Skip the read-back check |
+| `-y` | Don't ask for confirmation |
+
+Don't disconnect or switch off the radio while writing. If a restore fails
+halfway, run it again, or restore the automatic backup file.
+
 ## Converting to CHIRP CSV
 
 ```
@@ -139,8 +169,8 @@ original R8600 mode is added to the Comment column in brackets.
   programmable values like 12.3 kHz) are exported as 5 kHz, with the real step
   noted in the Comment column.
 - Scan edges and auto-memory-write channels are not exported.
-- Writing to the radio is not supported, on purpose. Use CS-R8600 to program the
-  radio.
+- `r8600_restore.py` writes the whole memory image; it can't change single
+  channels. Edit channels in CS-R8600, or restore a complete image.
 - Tested with one IC-R8600 (Europe) and CS-R8600 files. Other firmware versions
   or regional models may differ.
 
@@ -229,7 +259,11 @@ radio as `EF`.
 | Model answer | radio → PC | `E1` | `38 18 00 01`, then revision and other data |
 | Clone out | PC → radio | `E2` | `38 18 00 01` |
 | Memory data | radio → PC | `E4` | one block per frame, see below |
-| End of clone | radio → PC | `E5` | `Icom Inc.` followed by two more bytes |
+| End of clone | radio → PC | `E5` | `Icom Inc.A8` |
+| Clone in | PC → radio | `E3` | `38 18 00 01` |
+| Memory data | PC → radio | `E4` | same block format as when reading |
+| End of clone | PC → radio | `E5` | `Icom Inc.A8` |
+| Clone result | radio → PC | `E6` | `00` = OK |
 
 Each `E4` payload holds a 4-byte big-endian address, a 1-byte length (64 bytes
 per block), the data, and a checksum. The checksum is the two's complement of
@@ -242,6 +276,10 @@ frames as raw binary, encoded like this:
   so they can't be mistaken for frame markers. Undo this first.
 - Every data byte has its high bit inverted (`byte ^ 0x80`). The checksum is
   calculated over the inverted bytes, so check it before inverting back.
+
+Writing uses exactly the same encoding in the other direction. Byte 5 of the
+model answer is the memory map revision, which matches `#MapRev` in `.icf`
+files (3 on the tested radio).
 
 After decoding, the 125 440-byte image (`0x1EA00`) is identical to the data in a
 CS-R8600 `.icf` file. The radio answered at every tested speed from 9600 to

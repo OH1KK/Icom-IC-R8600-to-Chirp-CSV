@@ -10,12 +10,14 @@ and writes a CSV that CHIRP can open and import into other radios.
 ## Features
 
 - Reads `.icf` files saved by Icom CS-R8600 (model ID `38180001`)
-- Exports all 2000 regular memory channels, group by group, in the same order as
-  the receiver
+- Exports all memory channels with their real IC-R8600 channel numbers (0–1999)
+  as CHIRP locations, including gaps between channels
 - Decodes frequency, name, mode (all 18 R8600 modes), duplex and offset, tuning
-  step and CTCSS tone squelch
-- Puts the group number, group name and position in CHIRP's Comment column, e.g.
-  `G02 Repeaters #05`
+  step (including programmable steps), CTCSS and DTCS tone squelch, and
+  Skip / P-Skip
+- Puts the channel number, group number and group name in CHIRP's Comment column,
+  e.g. `CH0021 G00 PMR-446`, plus R8600-only settings such as antenna, P.AMP,
+  ATT, IP+ and scan SEL
 - Flags anything CHIRP can't represent exactly (S-AM, dPMR, DCR, unusual tuning
   steps) in the Comment column, so no information is silently lost
 - Single file, Python 3 standard library only, no dependencies
@@ -38,15 +40,16 @@ This writes `memories.csv` next to the input file. Open it in CHIRP with
 | Option | Description |
 |---|---|
 | `-o FILE`, `--output FILE` | Output CSV file (default: input name with `.csv`) |
-| `--start N` | First CHIRP location number (default `0`) |
-| `--group N` | Export only group `N`; repeat to export several groups |
+| `--renumber` | Number CHIRP locations sequentially instead of using the R8600 channel numbers |
+| `--start N` | First location number with `--renumber` (default `0`) |
+| `--group N` | Export only group `N`, numbered as in CS-R8600 (`00`–`99`); repeat to export several groups |
 | `--debug` | Print the raw 47-byte record of every channel to stderr |
 
 Examples:
 
 ```
-python3 r8600_icf2chirp.py memories.icf -o scanner.csv --start 1
-python3 r8600_icf2chirp.py memories.icf --group 1 --group 5
+python3 r8600_icf2chirp.py memories.icf -o scanner.csv --renumber --start 1
+python3 r8600_icf2chirp.py memories.icf --group 0 --group 5
 ```
 
 ## Mode mapping
@@ -68,14 +71,13 @@ original R8600 mode is added to the Comment column in brackets.
 
 ## Known limitations
 
-- **DTCS** is not decoded yet. Channels using DTCS (or any squelch type other than
-  CTCSS) get a marker like `[SQL?2/…]` in the Comment column instead.
-- **Skip** flags are not exported yet.
+- **R8600-only settings** (antenna, P.AMP, ATT, IP+, scan SEL 1–9, filter) have
+  no CHIRP columns. All except the filter are noted in the Comment column.
 - **Digital mode settings** (D-STAR, P25 NAC, NXDN RAN, dPMR/DCR codes) are not
   exported, because CHIRP's CSV format has no columns for them.
-- **Tuning steps** that CHIRP doesn't support (10 Hz, 100 Hz, 3.125 kHz,
-  8.33 kHz, programmable) are exported as 5 kHz, with the real step noted in the
-  Comment column.
+- **Tuning steps** that CHIRP doesn't support (100 Hz, 3.125 kHz, 8.33 kHz, and
+  programmable values like 12.3 kHz) are exported as 5 kHz, with the real step
+  noted in the Comment column.
 - Scan edges and auto-memory-write channels are not exported.
 - Only tested with files from CS-R8600. Files from other Icom software will not
   work.
@@ -94,40 +96,70 @@ Assembling all lines gives a binary memory image.
 
 | Offset | Size | Contents |
 |---|---|---|
-| `0x00000` | 2400 × 47 bytes | Channel slots: 0–1999 memory channels, 2300–2399 scan edges |
+| `0x00000` | 2400 × 47 bytes | Record slots: 0–1999 memory channels, 2000–2299 auto memory write, 2300–2399 scan edges |
 | `0x1B8C0` | 100 × 19 bytes | Group table |
-| `0x1C02C` | 2000 × uint16 | "Next channel" table |
-| `0x1CFCC` | 250 bytes | 2000-bit bitmap (purpose not confirmed, possibly skip) |
+| `0x1C02C` | 2000 × uint16 LE | "Next slot" table |
+| `0x1CFCC` | 250 bytes | Channel number bitmap, 2000 bits, 0 = number in use |
+| `0x1D4E1` | 2 × uint16 LE | Free chain head and tail slot |
+| `0x1D4E5` | 2000 bytes | Per-slot flags |
 
-### Groups
+### Groups, slots and channel numbers
 
-Channels are not stored in group order. Each group table entry is
-`[group number][first channel, uint16 LE][name, 16 chars]`, and the "next
-channel" table links each channel to the next one in its group. `0xFFFF` ends the
-chain. Unused channels form their own free chain and are skipped by the script.
+A channel's storage slot is not its channel number. Each group table entry is
+`[group number][first slot, uint16 LE][name, 16 chars]`. The stored group number
+is 1-based; CS-R8600 shows it 0-based. The "next slot" table links each slot to
+the next one in its group, and `0xFFFF` ends the chain. Unused slots form a
+separate free chain.
+
+Channel numbers come from the bitmap. Taking all groups in table order, and each
+group's channels in chain order, the channels map one to one onto the in-use
+bits of the bitmap in ascending order. Empty rows inside a group are simply
+numbers whose bit is not set.
+
+### Per-slot flags (`0x1D4E5`)
+
+| Bits | Field |
+|---|---|
+| 0 | Slot empty |
+| 1 | Skip |
+| 2 | P-Skip |
+| 4–7 | Scan SEL (0 = off, 1–9) |
 
 ### Channel record (47 bytes)
 
 | Offset | Type | Field |
 |---|---|---|
 | `0x00` | uint32 LE | Frequency in Hz |
-| `0x04` | uint8 | Bits 7–3: mode (0–17, see table above). Bits 2–0: filter (unconfirmed) |
-| `0x05` | uint16 LE | Flags. Bits 5–6: duplex (0 = simplex, 1 = −, 2 = +). Other bits unknown |
-| `0x07` | uint8 | Tuning step index: 10 Hz, 100 Hz, 1k, 3.125k, 5k, 6.25k, 8.33k, 9k, 10k, 12.5k, 20k, 25k, 100k |
-| `0x08` | uint16 LE | Unknown (always `500` so far, possibly the programmable step) |
+| `0x04` | uint8 | Bits 7–3: mode (0–17, see table above). Bits 2–0: filter (0 = FIL1, 1 = FIL2, 2 = FIL3) |
+| `0x05` | uint16 LE | Flags, see below |
+| `0x07` | uint8 | Tuning step index: 0 = 100 Hz, 1k, 2.5k, 3.125k, 5k, 6.25k, 8.33k, 9k, 10k, 12.5k, 20k, 25k, 12 = 100k, 13 = programmable |
+| `0x08` | uint16 LE | Programmable tuning step in 0.1 kHz units |
 | `0x0A` | uint32 LE | Duplex offset in Hz |
 | `0x0F` | char[16] | Name, padded with spaces |
-| `0x1F` | uint8 | Analog modes: squelch type (0 = off, 1 = CTCSS tone squelch) |
+| `0x1F` | uint8 | Analog modes: tone mode (0 = off, 1 = TSQL, 2 = DTCS) |
+| `0x20` | uint8 | Analog modes: DTCS polarity (0 = normal, 1 = reverse) |
 | `0x21` | uint8 | Analog modes: CTCSS tone index (0 = 67.0 Hz, standard 50-tone list) |
+| `0x22` | uint8 | Analog modes: DTCS code index (0 = 023, standard 104-code list) |
 
 For digital modes, bytes `0x1F`–`0x2E` hold mode-specific settings instead of
-tone data.
+tone data. These are not decoded yet.
+
+Flags word at `0x05`:
+
+| Bits | Field |
+|---|---|
+| 5–6 | Duplex (0 = off, 1 = −, 2 = +) |
+| 10 | P.AMP |
+| 11–12 | ATT (0 = off, 1 = 10 dB, 2 = 20 dB, 3 = 30 dB) |
+| 13–14 | Antenna (0 = ANT1, 1 = ANT2, 2 = ANT3) |
+| 15 | IP+ |
+| others | Unknown; bit 7 may be TS Function |
 
 ## Contributing
 
 Bug reports and pull requests are welcome. The easiest way to help decode the
 remaining fields is to save a small `.icf` file in CS-R8600 with a few channels
-whose names describe their settings (for example `DTCS 023 N` or `SKIP`), then
+whose names describe their settings (for example `P25 NAC 293`), then
 run the script with `--debug` and open an issue with the output and the file.
 
 ## Credits

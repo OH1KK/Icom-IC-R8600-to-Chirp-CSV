@@ -1,15 +1,27 @@
-# r8600_icf2chirp
+# IC-R8600 memory tools: radio → .icf → CHIRP
 
-Convert **Icom IC-R8600** memory channels from a CS-R8600 `.icf` save file into a
-**CHIRP** generic CSV file — no more typing the same channels in twice.
+Read the memory of an **Icom IC-R8600** receiver directly over USB on Linux,
+and convert its memory channels into a **CHIRP** generic CSV file. No CS-R8600,
+no Windows, and no typing the same channels in twice.
 
-CHIRP has no IC-R8600 driver, and CS-R8600 cannot export to CHIRP. This script
-reads the `.icf` file directly, decodes the memory channels and their groups,
-and writes a CSV that CHIRP can open and import into other radios.
+CHIRP has no IC-R8600 driver, and Icom's CS-R8600 programming software is
+Windows-only and cannot export to CHIRP. This project contains three small
+Python scripts:
+
+| Script | What it does |
+|---|---|
+| `r8600_probe.py` | Checks that the radio answers on its USB serial port |
+| `r8600_dump.py` | Reads the whole radio memory and saves it as an `.icf` file |
+| `r8600_icf2chirp.py` | Converts an `.icf` file into a CHIRP CSV |
+
+The `.icf` files written by `r8600_dump.py` open in CS-R8600 too, so the dump
+script also works as a Linux backup tool. Reading is always read-only: nothing
+is ever written to the radio.
 
 ## Features
 
-- Reads `.icf` files saved by Icom CS-R8600 (model ID `38180001`)
+- Reads the radio directly over USB with the Icom clone protocol (about 13
+  seconds for the full memory), or `.icf` files saved by CS-R8600
 - Exports all memory channels with their real IC-R8600 channel numbers (0–1999)
   as CHIRP locations, including gaps between channels
 - Decodes frequency, name, mode (all 18 R8600 modes), duplex and offset, tuning
@@ -20,20 +32,68 @@ and writes a CSV that CHIRP can open and import into other radios.
   ATT, IP+ and scan SEL
 - Flags anything CHIRP can't represent exactly (S-AM, dPMR, DCR, unusual tuning
   steps) in the Comment column, so no information is silently lost
-- Single file, Python 3 standard library only, no dependencies
+- The converter uses only the Python standard library; the radio scripts need
+  pyserial
 
 ## Requirements
 
-Python 3.6 or newer.
+- Python 3.6 or newer
+- For reading the radio: pyserial (`sudo apt install python3-serial` or
+  `pip install pyserial`) and an IC-R8600 connected with a USB cable
 
-## Usage
+## Quick start
+
+```
+python3 r8600_dump.py                        # writes ic-r8600-YYYYMMDD-HHMMSS.icf
+python3 r8600_icf2chirp.py ic-r8600-*.icf    # writes ic-r8600-....csv
+```
+
+Open the CSV in CHIRP with **File → Open**, then copy and paste the channels into
+your radio's memory tab.
+
+## Reading the radio
+
+The IC-R8600 shows up on Linux as two CP2102 USB serial ports, usually
+`/dev/ttyUSB0` and `/dev/ttyUSB1`. The clone protocol answers on the first one
+(serial number ending in `A`). Your user needs access to serial ports:
+
+```
+sudo usermod -aG dialout $USER     # then log out and back in
+```
+
+Close any other program that may hold the port open (rigctld, flrig, scanner
+software) before reading.
+
+### r8600_probe.py
+
+Sends only the model query to both ports at several speeds and prints what the
+radio answers. Use it to find the right port, or when something doesn't work.
+
+```
+python3 r8600_probe.py
+python3 r8600_probe.py -p /dev/ttyUSB0 -b 9600
+```
+
+### r8600_dump.py
+
+Reads the full memory (channels, groups, scan edges and settings) and writes an
+`.icf` file that both the converter and CS-R8600 can open.
+
+| Option | Description |
+|---|---|
+| `-p PORT` | Serial port (default `/dev/ttyUSB0`) |
+| `-b BAUD` | Speed (default `115200`; the radio answered at 9600–115200) |
+| `-o FILE` | Output file (default `ic-r8600-YYYYMMDD-HHMMSS.icf`) |
+| `-t SECONDS` | Give up after this long without data (default `10`) |
+| `--log FILE` | Save every raw byte from the radio, for troubleshooting |
+
+## Converting to CHIRP CSV
 
 ```
 python3 r8600_icf2chirp.py memories.icf
 ```
 
-This writes `memories.csv` next to the input file. Open it in CHIRP with
-**File → Open**, then copy and paste the channels into your radio's memory tab.
+This writes `memories.csv` next to the input file.
 
 ### Options
 
@@ -79,8 +139,10 @@ original R8600 mode is added to the Comment column in brackets.
   programmable values like 12.3 kHz) are exported as 5 kHz, with the real step
   noted in the Comment column.
 - Scan edges and auto-memory-write channels are not exported.
-- Only tested with files from CS-R8600. Files from other Icom software will not
-  work.
+- Writing to the radio is not supported, on purpose. Use CS-R8600 to program the
+  radio.
+- Tested with one IC-R8600 (Europe) and CS-R8600 files. Other firmware versions
+  or regional models may differ.
 
 ## ICF file format
 
@@ -155,6 +217,36 @@ Flags word at `0x05`:
 | 15 | IP+ |
 | others | Unknown; bit 7 may be TS Function |
 
+## Clone protocol
+
+`r8600_dump.py` uses Icom's clone protocol on the first USB serial port. Every
+frame is `FE FE <src> <dst> <cmd> <payload> FD`, with the PC as `EE` and the
+radio as `EF`.
+
+| Step | Direction | Command | Payload |
+|---|---|---|---|
+| Model query | PC → radio | `E0` | `00 00 00 00` |
+| Model answer | radio → PC | `E1` | `38 18 00 01`, then revision and other data |
+| Clone out | PC → radio | `E2` | `38 18 00 01` |
+| Memory data | radio → PC | `E4` | one block per frame, see below |
+| End of clone | radio → PC | `E5` | `Icom Inc.` followed by two more bytes |
+
+Each `E4` payload holds a 4-byte big-endian address, a 1-byte length (64 bytes
+per block), the data, and a checksum. The checksum is the two's complement of
+the sum of the address, length and data bytes as sent.
+
+Unlike older Icom radios, which send ASCII hex text, the IC-R8600 sends these
+frames as raw binary, encoded like this:
+
+- Bytes `0xFA`–`0xFF` are escaped as `0xFF` followed by the byte's low nibble,
+  so they can't be mistaken for frame markers. Undo this first.
+- Every data byte has its high bit inverted (`byte ^ 0x80`). The checksum is
+  calculated over the inverted bytes, so check it before inverting back.
+
+After decoding, the 125 440-byte image (`0x1EA00`) is identical to the data in a
+CS-R8600 `.icf` file. The radio answered at every tested speed from 9600 to
+115200 baud; a full read takes about 13 seconds.
+
 ## Contributing
 
 Bug reports and pull requests are welcome. The easiest way to help decode the
@@ -165,7 +257,7 @@ run the script with `--debug` and open an issue with the output and the file.
 ## Credits
 
 - Written by Kari, OH1KK
-- Format reverse-engineering and code developed together with
+- Format and protocol reverse-engineering and code developed together with
   [Claude](https://claude.ai) by Anthropic
 
 ## License
